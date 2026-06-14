@@ -62,16 +62,16 @@ blueprint:
     price_threshold:
       name: Preisgrenze für automatisches Laden
       description: >
-        Wenn der aktuelle Strompreis kleiner als dieser Wert ist, wird der Akku automatisch geladen.
-        Beispiel: 0.20 bei €/kWh oder 20 bei ct/kWh.
-      default: 0.20
+        Wenn der aktuelle Strompreis unter dieser Grenze liegt, wird der Akku automatisch geladen.
+        Angabe in €/kWh. Beispiel: 0.16 entspricht 16 ct/kWh.
+      default: 0.16
       selector:
         number:
-          min: -1
-          max: 2
+          min: -0.50
+          max: 1.00
           step: 0.001
           mode: box
-          unit_of_measurement: Preis
+          unit_of_measurement: "€/kWh"
 
     enable_price_charging:
       name: Automatisches Preis-Laden aktivieren
