@@ -1,10 +1,16 @@
 blueprint:
   name: 🔋 Hausbatterie Steuerung mit Wallbox & Strompreis
   description: >
-    Version 0.4
+    Version 0.6
 
     Steuert eine Hoymiles/MS-A2 Hausbatterie bei Wallbox-Ladung, manuellem
     Sofortladen und automatischem Laden bei günstigem Strompreis.
+
+    Änderungen in 0.6:
+    - Preisgrenze wird ausschließlich über einen input_number-Helfer gesetzt.
+    - Der alte hart kodierte price_threshold-Wert wurde vollständig entfernt.
+    - Automatisches Preisladen nutzt einen eigenen input_boolean-Helfer.
+    - Komma- und Punktwerte werden verarbeitet, z. B. 0,16 und 0.16.
 
     Prioritäten:
     1. Sofortladen aktiv und SOC unter Zielwert → Akku lädt.
@@ -18,8 +24,9 @@ blueprint:
     - input_number für Ziel-Ladestand
     - input_number für Preisgrenze in €/kWh
 
-    Die Preisgrenze kann in der Oberfläche z. B. als 0,16 €/kWh angezeigt werden.
-    Der Blueprint verarbeitet sowohl 0,16 als auch 0.16.
+    Wichtig:
+    Der Strompreis-Sensor und der Preisgrenzen-Helfer müssen beide in €/kWh arbeiten.
+    Beispiel: 0,16 €/kWh entspricht 16 ct/kWh.
   domain: automation
 
   input:
@@ -77,7 +84,6 @@ blueprint:
       description: >
         input_number-Helfer für die Preisgrenze in €/kWh.
         Beispiel: 0,16 entspricht 16 ct/kWh.
-        Der Blueprint verarbeitet sowohl 0,16 als auch 0.16.
       selector:
         entity:
           domain: input_number
@@ -93,7 +99,7 @@ blueprint:
           domain: sensor
 
     allow_price_charge_while_wallbox:
-      name: Preis-Laden auch während Wallbox-Ladung erlauben
+      name: Preisladen auch während Wallbox-Ladung erlauben
       description: >
         Aus = Wallbox hat Priorität, Hausakku entlädt nicht und lädt auch nicht.
         An = Hausakku darf bei günstigem Preis auch während Wallbox-Ladung laden.
@@ -214,34 +220,17 @@ action:
       normal_mode_option_var: !input normal_mode_option
       price_charge_hysteresis_var: !input price_charge_hysteresis
 
-      soc_raw: "{{ states(battery_soc_sensor_var) }}"
-      target_soc_raw: "{{ states(target_soc_number_var) }}"
-      price_threshold_raw: "{{ states(price_threshold_number_var) }}"
-      price_raw: "{{ states(price_sensor_var) }}"
-
-      soc_valid: >
-        {{ soc_raw not in ['unknown', 'unavailable', 'none', 'None', ''] }}
-
-      target_soc_valid: >
-        {{ target_soc_raw not in ['unknown', 'unavailable', 'none', 'None', ''] }}
-
-      price_threshold_valid: >
-        {{ price_threshold_raw not in ['unknown', 'unavailable', 'none', 'None', ''] }}
-
-      price_valid: >
-        {{ price_raw not in ['unknown', 'unavailable', 'none', 'None', ''] }}
-
       soc: >
         {{ (states(battery_soc_sensor_var) | string | replace(',', '.')) | float(999) }}
 
       target_soc: >
         {{ (states(target_soc_number_var) | string | replace(',', '.')) | float(0) }}
 
-      price_threshold: >
-        {{ (states(price_threshold_number_var) | string | replace(',', '.')) | float(0.16) }}
-
       price: >
         {{ (states(price_sensor_var) | string | replace(',', '.')) | float(999) }}
+
+      price_threshold: >
+        {{ (states(price_threshold_number_var) | string | replace(',', '.')) | float(0.16) }}
 
       wallbox_charging: >
         {{ is_state(wallbox_status_sensor_var, wallbox_charging_state_var) }}
@@ -251,6 +240,18 @@ action:
 
       price_charging_enabled: >
         {{ is_state(price_charging_switch_var, 'on') }}
+
+      soc_valid: >
+        {{ states(battery_soc_sensor_var) not in ['unknown', 'unavailable', 'none', 'None', ''] }}
+
+      target_soc_valid: >
+        {{ states(target_soc_number_var) not in ['unknown', 'unavailable', 'none', 'None', ''] }}
+
+      price_valid: >
+        {{ states(price_sensor_var) not in ['unknown', 'unavailable', 'none', 'None', ''] }}
+
+      price_threshold_valid: >
+        {{ states(price_threshold_number_var) not in ['unknown', 'unavailable', 'none', 'None', ''] }}
 
       manual_charge_active: >
         {{
@@ -284,11 +285,27 @@ action:
         }}
 
   - choose:
-      - alias: Laden aktiv - erst MQTT-Modus, dann Ladeleistung setzen
+      - alias: Sofortladen aktiv - Akku bis Ziel-SOC laden
         conditions:
           - condition: template
-            value_template: >
-              {{ manual_charge_active | bool(false) or price_charge_active | bool(false) }}
+            value_template: "{{ manual_charge_active | bool(false) }}"
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: !input battery_mode_select
+            data:
+              option: "{{ control_mode_option_var }}"
+
+          - service: number.set_value
+            target:
+              entity_id: !input battery_power_number
+            data:
+              value: "{{ charge_power_var | float(0) }}"
+
+      - alias: Automatisches Preisladen aktiv - Preis unter Grenze
+        conditions:
+          - condition: template
+            value_template: "{{ price_charge_active | bool(false) }}"
         sequence:
           - service: select.select_option
             target:
@@ -305,12 +322,7 @@ action:
       - alias: Wallbox lädt - Akku-Entladung stoppen
         conditions:
           - condition: template
-            value_template: >
-              {{
-                wallbox_charging | bool(false)
-                and not manual_charge_active | bool(false)
-                and not price_charge_active | bool(false)
-              }}
+            value_template: "{{ wallbox_charging | bool(false) }}"
         sequence:
           - service: select.select_option
             target:
