@@ -1,14 +1,14 @@
 blueprint:
   name: 🔋 Hausbatterie Steuerung mit Wallbox & Strompreis
   description: >
-    Version 0.2
+    Version 0.4
 
     Steuert eine Hoymiles/MS-A2 Hausbatterie bei Wallbox-Ladung, manuellem
     Sofortladen und automatischem Laden bei günstigem Strompreis.
 
     Prioritäten:
     1. Sofortladen aktiv und SOC unter Zielwert → Akku lädt.
-    2. Automatisches Preisladen aktiv, Strompreis unter Grenze und SOC unter Zielwert → Akku lädt.
+    2. Automatisches Preisladen aktiv, Strompreis unter Preisgrenze und SOC unter Zielwert → Akku lädt.
     3. Wallbox lädt → Akku-Entladung wird gestoppt.
     4. Sonst → sicherer Normalzustand: Leistung 0 W, Modus general.
 
@@ -16,6 +16,10 @@ blueprint:
     - input_boolean für Sofortladen
     - input_boolean für automatisches Preisladen
     - input_number für Ziel-Ladestand
+    - input_number für Preisgrenze in €/kWh
+
+    Die Preisgrenze kann in der Oberfläche z. B. als 0,16 €/kWh angezeigt werden.
+    Der Blueprint verarbeitet sowohl 0,16 als auch 0.16.
   domain: automation
 
   input:
@@ -68,28 +72,25 @@ blueprint:
         entity:
           domain: input_number
 
+    price_threshold_number:
+      name: Preisgrenze Helfer
+      description: >
+        input_number-Helfer für die Preisgrenze in €/kWh.
+        Beispiel: 0,16 entspricht 16 ct/kWh.
+        Der Blueprint verarbeitet sowohl 0,16 als auch 0.16.
+      selector:
+        entity:
+          domain: input_number
+
     price_sensor:
       name: Strompreis Sensor
       description: >
-        Sensor für den aktuellen Strompreis. Der State des Sensors muss den Preis
-        in €/kWh liefern. Beispiel: 0.16 entspricht 16 ct/kWh.
+        Sensor für den aktuellen Strompreis.
+        Der State des Sensors muss den Preis in €/kWh liefern.
+        Beispiel: 0,16 oder 0.16 entspricht 16 ct/kWh.
       selector:
         entity:
           domain: sensor
-
-    price_threshold:
-      name: Preisgrenze für automatisches Laden
-      description: >
-        Wenn der aktuelle Strompreis unter dieser Grenze liegt, wird der Akku
-        automatisch geladen. Angabe in €/kWh. Beispiel: 0.16 entspricht 16 ct/kWh.
-      default: 0.16
-      selector:
-        number:
-          min: -0.50
-          max: 1.00
-          step: 0.001
-          mode: box
-          unit_of_measurement: "€/kWh"
 
     allow_price_charge_while_wallbox:
       name: Preis-Laden auch während Wallbox-Ladung erlauben
@@ -150,7 +151,7 @@ blueprint:
       name: Hysterese für automatisches Preisladen
       description: >
         Verhindert häufiges Ein/Aus nahe dem Ziel-SOC.
-        Beispiel: 0.5 bedeutet, Preisladen startet nur unter Ziel-SOC minus 0.5%.
+        Beispiel: 0.5 bedeutet, Preisladen startet nur unter Ziel-SOC minus 0,5 %.
       default: 0.5
       selector:
         number:
@@ -178,6 +179,10 @@ trigger:
     id: target_soc_changed
 
   - platform: state
+    entity_id: !input price_threshold_number
+    id: price_threshold_changed
+
+  - platform: state
     entity_id: !input battery_soc_sensor
     id: soc_changed
 
@@ -195,12 +200,12 @@ action:
   - variables:
       battery_soc_sensor_var: !input battery_soc_sensor
       target_soc_number_var: !input target_soc_number
+      price_threshold_number_var: !input price_threshold_number
       price_sensor_var: !input price_sensor
       wallbox_status_sensor_var: !input wallbox_status_sensor
       force_charge_switch_var: !input force_charge_switch
       price_charging_switch_var: !input price_charging_switch
 
-      price_threshold_var: !input price_threshold
       allow_price_charge_while_wallbox_var: !input allow_price_charge_while_wallbox
       charge_power_var: !input charge_power
       neutral_power_var: !input neutral_power
@@ -210,17 +215,33 @@ action:
       price_charge_hysteresis_var: !input price_charge_hysteresis
 
       soc_raw: "{{ states(battery_soc_sensor_var) }}"
+      target_soc_raw: "{{ states(target_soc_number_var) }}"
+      price_threshold_raw: "{{ states(price_threshold_number_var) }}"
       price_raw: "{{ states(price_sensor_var) }}"
 
       soc_valid: >
         {{ soc_raw not in ['unknown', 'unavailable', 'none', 'None', ''] }}
 
+      target_soc_valid: >
+        {{ target_soc_raw not in ['unknown', 'unavailable', 'none', 'None', ''] }}
+
+      price_threshold_valid: >
+        {{ price_threshold_raw not in ['unknown', 'unavailable', 'none', 'None', ''] }}
+
       price_valid: >
         {{ price_raw not in ['unknown', 'unavailable', 'none', 'None', ''] }}
 
-      soc: "{{ states(battery_soc_sensor_var) | float(999) }}"
-      target_soc: "{{ states(target_soc_number_var) | float(0) }}"
-      price: "{{ states(price_sensor_var) | float(999) }}"
+      soc: >
+        {{ (states(battery_soc_sensor_var) | string | replace(',', '.')) | float(999) }}
+
+      target_soc: >
+        {{ (states(target_soc_number_var) | string | replace(',', '.')) | float(0) }}
+
+      price_threshold: >
+        {{ (states(price_threshold_number_var) | string | replace(',', '.')) | float(0.16) }}
+
+      price: >
+        {{ (states(price_sensor_var) | string | replace(',', '.')) | float(999) }}
 
       wallbox_charging: >
         {{ is_state(wallbox_status_sensor_var, wallbox_charging_state_var) }}
@@ -235,6 +256,7 @@ action:
         {{
           force_charge_on | bool(false)
           and soc_valid | bool(false)
+          and target_soc_valid | bool(false)
           and soc < target_soc
         }}
 
@@ -242,6 +264,7 @@ action:
         {{
           force_charge_on | bool(false)
           and soc_valid | bool(false)
+          and target_soc_valid | bool(false)
           and soc >= target_soc
         }}
 
@@ -249,8 +272,10 @@ action:
         {{
           price_charging_enabled | bool(false)
           and price_valid | bool(false)
+          and price_threshold_valid | bool(false)
           and soc_valid | bool(false)
-          and price < (price_threshold_var | float(0))
+          and target_soc_valid | bool(false)
+          and price < price_threshold
           and soc < (target_soc - (price_charge_hysteresis_var | float(0)))
           and (
             allow_price_charge_while_wallbox_var | bool(false)
