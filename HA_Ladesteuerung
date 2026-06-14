@@ -1,0 +1,317 @@
+blueprint:
+  name: 🔋 Hausbatterie Steuerung mit Wallbox & Strompreis
+  description: >
+    Steuert eine Hoymiles/MS-A2 Hausbatterie bei Wallbox-Ladung, manuellem
+    Sofortladen und automatischem Laden bei günstigem Strompreis.
+    Benötigt keine zusätzlichen Helfer außer einem Sofortladen-Schalter
+    und einem Ziel-Ladestand.
+  domain: automation
+
+  input:
+    battery_mode_select:
+      name: Batterie Betriebsmodus Select
+      description: z. B. select.msa_280024230201_mqtt_select
+      selector:
+        entity:
+          domain: select
+
+    battery_power_number:
+      name: Batterie Leistungs-Number
+      description: z. B. number.msa_280024230201
+      selector:
+        entity:
+          domain: number
+
+    battery_soc_sensor:
+      name: Batterie SOC Sensor
+      description: z. B. sensor.msa_280024230201_state_of_charge_system
+      selector:
+        entity:
+          domain: sensor
+
+    wallbox_status_sensor:
+      name: Wallbox Status Sensor
+      description: z. B. sensor.easee_charge_up_status
+      selector:
+        entity:
+          domain: sensor
+
+    force_charge_switch:
+      name: Sofortladen Schalter
+      description: z. B. input_boolean.akku_sofort_laden
+      selector:
+        entity:
+          domain: input_boolean
+
+    target_soc_number:
+      name: Ziel-Ladestand
+      description: z. B. input_number.akku_ziel_ladestand
+      selector:
+        entity:
+          domain: input_number
+
+    price_sensor:
+      name: Strompreis Sensor
+      description: >
+        Sensor für den aktuellen Strompreis. Wichtig: Einheit muss zur Preisgrenze passen,
+        also z. B. €/kWh zu €/kWh oder ct/kWh zu ct/kWh.
+      selector:
+        entity:
+          domain: sensor
+
+    price_threshold:
+      name: Preisgrenze für automatisches Laden
+      description: >
+        Wenn der aktuelle Strompreis kleiner als dieser Wert ist, wird der Akku automatisch geladen.
+        Beispiel: 0.20 bei €/kWh oder 20 bei ct/kWh.
+      default: 0.20
+      selector:
+        number:
+          min: -1
+          max: 2
+          step: 0.001
+          mode: box
+          unit_of_measurement: Preis
+
+    enable_price_charging:
+      name: Automatisches Preis-Laden aktivieren
+      default: true
+      selector:
+        boolean: {}
+
+    allow_price_charge_while_wallbox:
+      name: Preis-Laden auch während Wallbox-Ladung erlauben
+      description: >
+        Aus = Wallbox hat Priorität, Hausakku entlädt nicht und lädt auch nicht.
+        An = Hausakku darf bei günstigem Preis auch während Wallbox-Ladung laden.
+      default: false
+      selector:
+        boolean: {}
+
+    charge_power:
+      name: Ladeleistung
+      description: >
+        Negativer Wert lädt den Akku. Für MS-A2 typischerweise -800.
+      default: -800
+      selector:
+        number:
+          min: -3000
+          max: 0
+          step: 10
+          mode: box
+          unit_of_measurement: W
+
+    neutral_power:
+      name: Neutralleistung
+      description: Normalerweise 0 W.
+      default: 0
+      selector:
+        number:
+          min: -3000
+          max: 3000
+          step: 10
+          mode: box
+          unit_of_measurement: W
+
+    wallbox_charging_state:
+      name: Wallbox Status für "lädt"
+      description: Bei Easee normalerweise charging.
+      default: charging
+      selector:
+        text: {}
+
+    control_mode_option:
+      name: Batterie Steuerungsmodus
+      description: Bei MS-A2 normalerweise mqtt_ctrl.
+      default: mqtt_ctrl
+      selector:
+        text: {}
+
+    normal_mode_option:
+      name: Batterie Normalmodus
+      description: Bei MS-A2 normalerweise general.
+      default: general
+      selector:
+        text: {}
+
+    price_charge_hysteresis:
+      name: Hysterese für automatisches Preis-Laden
+      description: >
+        Verhindert häufiges Ein/Aus nahe dem Ziel-SOC.
+        Beispiel: 0.5 bedeutet, Preis-Laden startet nur unter Ziel-SOC minus 0.5%.
+      default: 0.5
+      selector:
+        number:
+          min: 0
+          max: 5
+          step: 0.1
+          mode: box
+          unit_of_measurement: "%"
+
+triggers:
+  - trigger: state
+    entity_id: !input wallbox_status_sensor
+    id: wallbox_changed
+
+  - trigger: state
+    entity_id: !input force_charge_switch
+    id: force_charge_changed
+
+  - trigger: state
+    entity_id: !input target_soc_number
+    id: target_soc_changed
+
+  - trigger: state
+    entity_id: !input battery_soc_sensor
+    id: soc_changed
+
+  - trigger: state
+    entity_id: !input price_sensor
+    id: price_changed
+
+  - trigger: time_pattern
+    seconds: "/30"
+    id: repeat_send
+
+conditions: []
+
+actions:
+  - variables:
+      battery_soc_sensor_var: !input battery_soc_sensor
+      target_soc_number_var: !input target_soc_number
+      price_sensor_var: !input price_sensor
+      wallbox_status_sensor_var: !input wallbox_status_sensor
+      force_charge_switch_var: !input force_charge_switch
+
+      price_threshold_var: !input price_threshold
+      enable_price_charging_var: !input enable_price_charging
+      allow_price_charge_while_wallbox_var: !input allow_price_charge_while_wallbox
+      charge_power_var: !input charge_power
+      neutral_power_var: !input neutral_power
+      wallbox_charging_state_var: !input wallbox_charging_state
+      control_mode_option_var: !input control_mode_option
+      normal_mode_option_var: !input normal_mode_option
+      price_charge_hysteresis_var: !input price_charge_hysteresis
+
+      soc_raw: "{{ states(battery_soc_sensor_var) }}"
+      price_raw: "{{ states(price_sensor_var) }}"
+
+      soc_valid: >
+        {{ soc_raw not in ['unknown', 'unavailable', 'none', 'None', ''] }}
+      price_valid: >
+        {{ price_raw not in ['unknown', 'unavailable', 'none', 'None', ''] }}
+
+      soc: "{{ states(battery_soc_sensor_var) | float(999) }}"
+      target_soc: "{{ states(target_soc_number_var) | float(0) }}"
+      price: "{{ states(price_sensor_var) | float(999) }}"
+
+      wallbox_charging: >
+        {{ is_state(wallbox_status_sensor_var, wallbox_charging_state_var) }}
+
+      force_charge_on: >
+        {{ is_state(force_charge_switch_var, 'on') }}
+
+      manual_charge_active: >
+        {{
+          force_charge_on | bool(false)
+          and soc_valid | bool(false)
+          and soc < target_soc
+        }}
+
+      manual_target_reached: >
+        {{
+          force_charge_on | bool(false)
+          and soc_valid | bool(false)
+          and soc >= target_soc
+        }}
+
+      price_charge_active: >
+        {{
+          enable_price_charging_var | bool(false)
+          and price_valid | bool(false)
+          and soc_valid | bool(false)
+          and price < (price_threshold_var | float(0))
+          and soc < (target_soc - (price_charge_hysteresis_var | float(0)))
+          and (
+            allow_price_charge_while_wallbox_var | bool(false)
+            or not (wallbox_charging | bool(false))
+          )
+        }}
+
+      target_mode: >
+        {% if manual_charge_active | bool(false) or price_charge_active | bool(false) or wallbox_charging | bool(false) %}
+          {{ control_mode_option_var }}
+        {% else %}
+          {{ normal_mode_option_var }}
+        {% endif %}
+
+      target_power: >
+        {% if manual_charge_active | bool(false) or price_charge_active | bool(false) %}
+          {{ charge_power_var | float(0) }}
+        {% else %}
+          {{ neutral_power_var | float(0) }}
+        {% endif %}
+
+  - choose:
+      - alias: Laden aktiv - erst MQTT-Modus, dann Ladeleistung setzen
+        conditions:
+          - condition: template
+            value_template: >
+              {{ manual_charge_active | bool(false) or price_charge_active | bool(false) }}
+        sequence:
+          - action: select.select_option
+            target:
+              entity_id: !input battery_mode_select
+            data:
+              option: "{{ control_mode_option_var }}"
+          - action: number.set_value
+            target:
+              entity_id: !input battery_power_number
+            data:
+              value: "{{ charge_power_var | float(0) }}"
+
+      - alias: Wallbox lädt - Akku-Entladung stoppen
+        conditions:
+          - condition: template
+            value_template: >
+              {{
+                wallbox_charging | bool(false)
+                and not manual_charge_active | bool(false)
+                and not price_charge_active | bool(false)
+              }}
+        sequence:
+          - action: select.select_option
+            target:
+              entity_id: !input battery_mode_select
+            data:
+              option: "{{ control_mode_option_var }}"
+          - action: number.set_value
+            target:
+              entity_id: !input battery_power_number
+            data:
+              value: "{{ neutral_power_var | float(0) }}"
+
+    default:
+      - alias: Sicherer Normalzustand - erst Leistung 0, dann general
+        action: number.set_value
+        target:
+          entity_id: !input battery_power_number
+        data:
+          value: "{{ neutral_power_var | float(0) }}"
+
+      - action: select.select_option
+        target:
+          entity_id: !input battery_mode_select
+        data:
+          option: "{{ normal_mode_option_var }}"
+
+  - if:
+      - condition: template
+        value_template: "{{ manual_target_reached | bool(false) }}"
+    then:
+      - action: input_boolean.turn_off
+        target:
+          entity_id: !input force_charge_switch
+
+mode: restart
+max_exceeded: silent
