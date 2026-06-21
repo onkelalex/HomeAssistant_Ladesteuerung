@@ -1,24 +1,27 @@
 blueprint:
   name: 🔋 Hausbatterie Steuerung mit Wallbox & Strompreis
   description: >
-    Version 0.7
+    Version 0.8
 
     Steuert eine Hoymiles/MS-A2 Hausbatterie bei Wallbox-Ladung,
-    automatischem Preisladen und preisabhängiger Akku-Entladung.
+    manuellem Sofortladen, automatischem Preisladen und preisabhängiger
+    Akku-Entladung.
 
-    Änderungen in 0.7:
+    Änderungen in 0.8:
     - Automatisches Preisladen bleibt über einen eigenen input_boolean-Helfer steuerbar.
-    - Die Preisgrenze kommt ausschließlich aus einem input_number-Helfer in €/kWh.
+    - Die Lade-Preisgrenze kommt ausschließlich aus einem input_number-Helfer in €/kWh.
     - Der Akku lädt bei günstigem Strompreis bis zum Ziel-Ladestand.
     - Der Akku entlädt nur noch, wenn der Strompreis teuer genug ist.
-    - "Teuer genug" bedeutet: aktueller Strompreis >= Preisgrenze + Entlade-Aufschlag.
-    - Zusätzlich gibt es einen Schalter, um Akku-Entladung komplett zu sperren.
+    - "Teuer genug" bedeutet: aktueller Strompreis >= Lade-Preisgrenze + Entlade-Preisaufschlag.
+    - Der Entlade-Preisaufschlag ist als Eingabefeld im Blueprint konfigurierbar.
+    - Der Mindestwert für den Entlade-Preisaufschlag ist 0,10 €/kWh.
+    - Zusätzlich gibt es einen Schalter, um die Akku-Entladung komplett zu sperren.
     - Wenn Entladung nicht erlaubt ist, wird die Batterie auf mqtt_ctrl mit 0 W gesetzt.
     - Komma- und Punktwerte werden verarbeitet, z. B. 0,16 und 0.16.
 
     Logik:
     1. Sofortladen aktiv und SOC unter Zielwert → Akku lädt.
-    2. Automatisches Preisladen aktiv, Strompreis unter Preisgrenze und SOC unter Zielwert → Akku lädt.
+    2. Automatisches Preisladen aktiv, Strompreis unter Lade-Preisgrenze und SOC unter Zielwert → Akku lädt.
     3. Wallbox lädt → Akku-Entladung wird gestoppt.
     4. Entladung gesperrt → Akku bleibt neutral bei 0 W.
     5. Strompreis nicht teuer genug → Akku bleibt neutral bei 0 W.
@@ -29,7 +32,7 @@ blueprint:
     - input_boolean für automatisches Preisladen
     - input_boolean für Entladung sperren
     - input_number für Ziel-Ladestand
-    - input_number für Preisgrenze in €/kWh
+    - input_number für Lade-Preisgrenze in €/kWh
 
     Wichtig:
     Der Strompreis-Sensor und der Preisgrenzen-Helfer müssen beide in €/kWh arbeiten.
@@ -98,7 +101,7 @@ blueprint:
           domain: input_number
 
     price_threshold_number:
-      name: Preisgrenze Helfer
+      name: Lade-Preisgrenze Helfer
       description: >
         input_number-Helfer für die Lade-Preisgrenze in €/kWh.
         Beispiel: 0,16 entspricht 16 ct/kWh.
@@ -154,12 +157,13 @@ blueprint:
       name: Entladen erst ab Preisaufschlag
       description: >
         Aufschlag auf die Lade-Preisgrenze, ab dem der Akku wieder entladen darf.
-        Angabe in €/kWh. Beispiel: 0,05 bedeutet 5 ct/kWh.
-        Bei Lade-Preisgrenze 0,16 und Aufschlag 0,05 darf der Akku erst ab 0,21 €/kWh entladen.
-      default: 0.05
+        Angabe in €/kWh. Der Mindestwert ist 0,10 €/kWh, also 10 ct/kWh.
+        Beispiel: Bei Lade-Preisgrenze 0,16 €/kWh und Aufschlag 0,10 €/kWh
+        darf der Akku erst ab 0,26 €/kWh wieder entladen.
+      default: 0.10
       selector:
         number:
-          min: 0
+          min: 0.10
           max: 1
           step: 0.001
           mode: box
@@ -256,10 +260,13 @@ action:
       price_threshold: >
         {{ (states(price_threshold_number_var) | string | replace(',', '.')) | float(0.16) }}
 
+      discharge_price_offset_value: >
+        {{ discharge_price_offset_var | float(0.10) }}
+
       discharge_price_limit: >
         {{
           ((states(price_threshold_number_var) | string | replace(',', '.')) | float(0.16))
-          + (discharge_price_offset_var | float(0.05))
+          + (discharge_price_offset_var | float(0.10))
         }}
 
       wallbox_charging: >
