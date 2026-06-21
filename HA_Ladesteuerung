@@ -1,26 +1,33 @@
 blueprint:
   name: 🔋 Hausbatterie Steuerung mit Wallbox & Strompreis
   description: >
-    Version 0.6
+    Version 0.7
 
-    Steuert eine Hoymiles/MS-A2 Hausbatterie bei Wallbox-Ladung, manuellem
-    Sofortladen und automatischem Laden bei günstigem Strompreis.
+    Steuert eine Hoymiles/MS-A2 Hausbatterie bei Wallbox-Ladung,
+    automatischem Preisladen und preisabhängiger Akku-Entladung.
 
-    Änderungen in 0.6:
-    - Preisgrenze wird ausschließlich über einen input_number-Helfer gesetzt.
-    - Der alte hart kodierte price_threshold-Wert wurde vollständig entfernt.
-    - Automatisches Preisladen nutzt einen eigenen input_boolean-Helfer.
+    Änderungen in 0.7:
+    - Automatisches Preisladen bleibt über einen eigenen input_boolean-Helfer steuerbar.
+    - Die Preisgrenze kommt ausschließlich aus einem input_number-Helfer in €/kWh.
+    - Der Akku lädt bei günstigem Strompreis bis zum Ziel-Ladestand.
+    - Der Akku entlädt nur noch, wenn der Strompreis teuer genug ist.
+    - "Teuer genug" bedeutet: aktueller Strompreis >= Preisgrenze + Entlade-Aufschlag.
+    - Zusätzlich gibt es einen Schalter, um Akku-Entladung komplett zu sperren.
+    - Wenn Entladung nicht erlaubt ist, wird die Batterie auf mqtt_ctrl mit 0 W gesetzt.
     - Komma- und Punktwerte werden verarbeitet, z. B. 0,16 und 0.16.
 
-    Prioritäten:
+    Logik:
     1. Sofortladen aktiv und SOC unter Zielwert → Akku lädt.
     2. Automatisches Preisladen aktiv, Strompreis unter Preisgrenze und SOC unter Zielwert → Akku lädt.
     3. Wallbox lädt → Akku-Entladung wird gestoppt.
-    4. Sonst → sicherer Normalzustand: Leistung 0 W, Modus general.
+    4. Entladung gesperrt → Akku bleibt neutral bei 0 W.
+    5. Strompreis nicht teuer genug → Akku bleibt neutral bei 0 W.
+    6. Strompreis teuer genug → Akku darf im Normalmodus entladen.
 
     Benötigte Helfer:
     - input_boolean für Sofortladen
     - input_boolean für automatisches Preisladen
+    - input_boolean für Entladung sperren
     - input_number für Ziel-Ladestand
     - input_number für Preisgrenze in €/kWh
 
@@ -72,6 +79,17 @@ blueprint:
         entity:
           domain: input_boolean
 
+    discharge_block_switch:
+      name: Akku-Entladung sperren Schalter
+      description: >
+        input_boolean-Helfer zum Sperren der Akku-Entladung.
+        Wenn dieser Schalter an ist, wird die Batterie nicht entladen.
+        Laden bei günstigem Strompreis oder Sofortladen bleibt weiterhin möglich.
+        Beispiel: input_boolean.akku_entladung_sperren
+      selector:
+        entity:
+          domain: input_boolean
+
     target_soc_number:
       name: Ziel-Ladestand
       description: z. B. input_number.akku_ziel_ladestand
@@ -82,7 +100,7 @@ blueprint:
     price_threshold_number:
       name: Preisgrenze Helfer
       description: >
-        input_number-Helfer für die Preisgrenze in €/kWh.
+        input_number-Helfer für die Lade-Preisgrenze in €/kWh.
         Beispiel: 0,16 entspricht 16 ct/kWh.
       selector:
         entity:
@@ -132,6 +150,21 @@ blueprint:
           mode: box
           unit_of_measurement: W
 
+    discharge_price_offset:
+      name: Entladen erst ab Preisaufschlag
+      description: >
+        Aufschlag auf die Lade-Preisgrenze, ab dem der Akku wieder entladen darf.
+        Angabe in €/kWh. Beispiel: 0,05 bedeutet 5 ct/kWh.
+        Bei Lade-Preisgrenze 0,16 und Aufschlag 0,05 darf der Akku erst ab 0,21 €/kWh entladen.
+      default: 0.05
+      selector:
+        number:
+          min: 0
+          max: 1
+          step: 0.001
+          mode: box
+          unit_of_measurement: "€/kWh"
+
     wallbox_charging_state:
       name: Wallbox Status für "lädt"
       description: Bei Easee normalerweise charging.
@@ -153,20 +186,6 @@ blueprint:
       selector:
         text: {}
 
-    price_charge_hysteresis:
-      name: Hysterese für automatisches Preisladen
-      description: >
-        Verhindert häufiges Ein/Aus nahe dem Ziel-SOC.
-        Beispiel: 0.5 bedeutet, Preisladen startet nur unter Ziel-SOC minus 0,5 %.
-      default: 0.5
-      selector:
-        number:
-          min: 0
-          max: 5
-          step: 0.1
-          mode: box
-          unit_of_measurement: "%"
-
 trigger:
   - platform: state
     entity_id: !input wallbox_status_sensor
@@ -179,6 +198,10 @@ trigger:
   - platform: state
     entity_id: !input price_charging_switch
     id: price_charging_switch_changed
+
+  - platform: state
+    entity_id: !input discharge_block_switch
+    id: discharge_block_changed
 
   - platform: state
     entity_id: !input target_soc_number
@@ -211,14 +234,15 @@ action:
       wallbox_status_sensor_var: !input wallbox_status_sensor
       force_charge_switch_var: !input force_charge_switch
       price_charging_switch_var: !input price_charging_switch
+      discharge_block_switch_var: !input discharge_block_switch
 
       allow_price_charge_while_wallbox_var: !input allow_price_charge_while_wallbox
       charge_power_var: !input charge_power
       neutral_power_var: !input neutral_power
+      discharge_price_offset_var: !input discharge_price_offset
       wallbox_charging_state_var: !input wallbox_charging_state
       control_mode_option_var: !input control_mode_option
       normal_mode_option_var: !input normal_mode_option
-      price_charge_hysteresis_var: !input price_charge_hysteresis
 
       soc: >
         {{ (states(battery_soc_sensor_var) | string | replace(',', '.')) | float(999) }}
@@ -232,6 +256,12 @@ action:
       price_threshold: >
         {{ (states(price_threshold_number_var) | string | replace(',', '.')) | float(0.16) }}
 
+      discharge_price_limit: >
+        {{
+          ((states(price_threshold_number_var) | string | replace(',', '.')) | float(0.16))
+          + (discharge_price_offset_var | float(0.05))
+        }}
+
       wallbox_charging: >
         {{ is_state(wallbox_status_sensor_var, wallbox_charging_state_var) }}
 
@@ -240,6 +270,9 @@ action:
 
       price_charging_enabled: >
         {{ is_state(price_charging_switch_var, 'on') }}
+
+      discharge_blocked: >
+        {{ is_state(discharge_block_switch_var, 'on') }}
 
       soc_valid: >
         {{ states(battery_soc_sensor_var) not in ['unknown', 'unavailable', 'none', 'None', ''] }}
@@ -258,7 +291,7 @@ action:
           force_charge_on | bool(false)
           and soc_valid | bool(false)
           and target_soc_valid | bool(false)
-          and soc < target_soc
+          and (soc | float(999)) < (target_soc | float(0))
         }}
 
       manual_target_reached: >
@@ -266,7 +299,7 @@ action:
           force_charge_on | bool(false)
           and soc_valid | bool(false)
           and target_soc_valid | bool(false)
-          and soc >= target_soc
+          and (soc | float(999)) >= (target_soc | float(0))
         }}
 
       price_charge_active: >
@@ -276,12 +309,26 @@ action:
           and price_threshold_valid | bool(false)
           and soc_valid | bool(false)
           and target_soc_valid | bool(false)
-          and price < price_threshold
-          and soc < (target_soc - (price_charge_hysteresis_var | float(0)))
+          and (price | float(999)) < (price_threshold | float(0.16))
+          and (soc | float(999)) < (target_soc | float(0))
           and (
             allow_price_charge_while_wallbox_var | bool(false)
             or not (wallbox_charging | bool(false))
           )
+        }}
+
+      price_expensive_for_discharge: >
+        {{
+          price_valid | bool(false)
+          and price_threshold_valid | bool(false)
+          and (price | float(999)) >= (discharge_price_limit | float(999))
+        }}
+
+      discharge_allowed: >
+        {{
+          not (wallbox_charging | bool(false))
+          and not (discharge_blocked | bool(false))
+          and price_expensive_for_discharge | bool(false)
         }}
 
   - choose:
@@ -336,8 +383,29 @@ action:
             data:
               value: "{{ neutral_power_var | float(0) }}"
 
+      - alias: Entladung gesperrt oder Strompreis nicht teuer genug - Akku neutral halten
+        conditions:
+          - condition: template
+            value_template: >
+              {{
+                discharge_blocked | bool(false)
+                or not (price_expensive_for_discharge | bool(false))
+              }}
+        sequence:
+          - service: select.select_option
+            target:
+              entity_id: !input battery_mode_select
+            data:
+              option: "{{ control_mode_option_var }}"
+
+          - service: number.set_value
+            target:
+              entity_id: !input battery_power_number
+            data:
+              value: "{{ neutral_power_var | float(0) }}"
+
     default:
-      - alias: Sicherer Normalzustand - erst Leistung 0, dann Normalmodus
+      - alias: Strompreis teuer genug - Entladung freigeben
         service: number.set_value
         target:
           entity_id: !input battery_power_number
