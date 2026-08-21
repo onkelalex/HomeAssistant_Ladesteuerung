@@ -1,19 +1,23 @@
 blueprint:
   name: 🔋 Hausbatterie Steuerung mit Wallbox & Strompreis
   description: >
-    Version 0.9
+    Version 0.9.3
 
     Steuert eine Hoymiles/MS-A2 Hausbatterie bei Wallbox-Ladung,
     manuellem Sofortladen, dynamischem Preisladen und preisabhängiger
     Akku-Entladung.
 
-    Änderungen in 0.9:
+    Änderungen in 0.9.3:
     - Wertet die 15-Minuten-Preise aus dem Tibber-Diagramm-Datenexport aus.
-    - Berechnet aus SOC, Ziel-SOC, Kapazität und Ladeleistung automatisch die
-      Anzahl der benötigten günstigen Viertelstunden.
+    - Berechnet bei 1,2 kW Ladeleistung aus SOC, Ziel-SOC und Kapazität automatisch
+      die Anzahl der benötigten günstigen Viertelstunden.
+    - Sucht die nächste Kostenspitze mit mindestens 10 ct/kWh Preisabstand und
+      plant die Ladung gezielt in die günstigsten Zeitfenster vor dieser Spitze.
+    - Gibt es keine solche Spitze, wird trotzdem in den günstigsten Zeitfenstern
+      des Planungshorizonts geladen. Der Preisaufschlag sperrt nur die Entladung.
     - Der bisherige Preislade-Schalter aktiviert die gesamte Preisautomatik.
     - Der Akku entlädt nur, wenn der Preis gegenüber dem geplanten Ladepreis
-      unter Berücksichtigung von Wirkungsgrad und Mindestaufschlag teuer genug ist.
+      mindestens um den eingestellten Preisaufschlag höher liegt.
     - Die bisherige Lade-Preisgrenze kann optional als absolute Obergrenze dienen.
     - Der Entlade-Preisaufschlag ist als Eingabefeld im Blueprint konfigurierbar.
     - Der Mindestwert für den Entlade-Preisaufschlag ist 0,10 €/kWh.
@@ -95,14 +99,6 @@ blueprint:
         entity:
           domain: sensor
 
-    efficiency_entity:
-      name: Gemessener Gesamtwirkungsgrad
-      description: >
-        Entität mit dem Wirkungsgrad in Prozent. Bei unplausiblem Wert werden 85 % verwendet.
-        Beispiel: number.hausakku_wirkungsgrad_gesamt
-      selector:
-        entity: {}
-
     discharge_block_switch:
       name: Akku-Entladung sperren Schalter
       description: >
@@ -161,8 +157,8 @@ blueprint:
     charge_power:
       name: Ladeleistung
       description: >
-        Negativer Wert lädt den Akku. Für MS-A2 typischerweise -800.
-      default: -800
+        Negativer Wert lädt den Akku. Für deine beiden MS-A2 zusammen -1200.
+      default: -1200
       selector:
         number:
           min: -3000
@@ -186,7 +182,8 @@ blueprint:
     planning_horizon:
       name: Planungshorizont
       description: >
-        Zeitraum, in dem die günstigsten verfügbaren Viertelstunden gesucht werden.
+        Zeitraum, in dem die nächste Kostenspitze und die davorliegenden
+        günstigen Viertelstunden gesucht werden.
         Sind noch keine Preise für morgen vorhanden, werden nur die vorhandenen Daten genutzt.
       default: 24
       selector:
@@ -283,10 +280,6 @@ trigger:
     entity_id: !input price_chart_sensor
     id: price_chart_changed
 
-  - platform: state
-    entity_id: !input efficiency_entity
-    id: efficiency_changed
-
   - platform: time_pattern
     seconds: "/30"
     id: repeat_send
@@ -300,7 +293,6 @@ action:
       price_threshold_number_var: !input price_threshold_number
       price_sensor_var: !input price_sensor
       price_chart_sensor_var: !input price_chart_sensor
-      efficiency_entity_var: !input efficiency_entity
       wallbox_status_sensor_var: !input wallbox_status_sensor
       force_charge_switch_var: !input force_charge_switch
       price_charging_switch_var: !input price_charging_switch
@@ -329,13 +321,6 @@ action:
       price_threshold: >
         {{ (states(price_threshold_number_var) | string | replace(',', '.')) | float(0.16) }}
 
-      efficiency_percent: >
-        {{ (states(efficiency_entity_var) | string | replace(',', '.')) | float(85) }}
-
-      efficiency: >
-        {% set measured = (states(efficiency_entity_var) | string | replace(',', '.')) | float(85) %}
-        {{ measured / 100 if 60 <= measured <= 98 else 0.85 }}
-
       chart_data: >
         {{ state_attr(price_chart_sensor_var, 'data') or [] }}
 
@@ -343,42 +328,72 @@ action:
         {{ [0, (battery_capacity_var | float(4.48)) * ((target_soc | float(0)) - (soc | float(999))) / 100] | max }}
 
       energy_per_slot_kwh: >
-        {{ ((charge_power_var | float(-800)) | abs) / 1000 * 0.25 }}
+        {{ ((charge_power_var | float(-1200)) | abs) / 1000 * 0.25 }}
 
       required_slots: >
-        {% set per_slot = ((charge_power_var | float(-800)) | abs) / 1000 * 0.25 %}
+        {% set per_slot = ((charge_power_var | float(-1200)) | abs) / 1000 * 0.25 %}
         {% set energy = [0, (battery_capacity_var | float(4.48)) * ((target_soc | float(0)) - (soc | float(999))) / 100] | max %}
         {{ (energy / per_slot) | round(0, 'ceil') | int if per_slot > 0 else 0 }}
 
-      available_future_prices: >
-        {% set ns = namespace(values=[]) %}
+      next_peak_start_ts: >
+        {% set ns = namespace(lowest=999, peak=0) %}
         {% set end_ts = as_timestamp(now()) + (planning_horizon_var | float(24)) * 3600 %}
         {% for item in chart_data if item is mapping %}
           {% set start_ts = as_timestamp(item.start_time, 0) %}
           {% set item_price = item.price_per_kwh | float(999) %}
           {% if start_ts > 0 and start_ts + 900 > as_timestamp(now()) and start_ts < end_ts and item_price < 999 %}
+            {% if item_price < ns.lowest %}
+              {% set ns.lowest = item_price %}
+            {% endif %}
+            {% if ns.peak == 0 and item_price >= ns.lowest + (discharge_price_offset_var | float(0.10)) %}
+              {% set ns.peak = start_ts %}
+            {% endif %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.peak }}
+
+      charge_window_prices: >
+        {% set ns = namespace(values=[]) %}
+        {% set peak_ts = next_peak_start_ts | float(0) %}
+        {% set horizon_end = as_timestamp(now()) + (planning_horizon_var | float(24)) * 3600 %}
+        {% set charge_end = peak_ts if peak_ts > 0 else horizon_end %}
+        {% for item in chart_data if item is mapping %}
+          {% set start_ts = as_timestamp(item.start_time, 0) %}
+          {% set item_price = item.price_per_kwh | float(999) %}
+          {% if start_ts > 0 and start_ts + 900 > as_timestamp(now()) and start_ts < charge_end and item_price < 999 %}
             {% set ns.values = ns.values + [item_price] %}
           {% endif %}
         {% endfor %}
         {{ ns.values }}
 
       planned_charge_price_limit: >
-        {% set prices = available_future_prices | list | sort %}
-        {% set slots = [required_slots | int(0), 1] | max %}
-        {% if prices | count > 0 %}
+        {% set prices = charge_window_prices | list | sort %}
+        {% set slots = required_slots | int(0) %}
+        {% if prices | count > 0 and slots > 0 %}
           {{ prices[[slots, prices | count] | min - 1] | float(999) }}
         {% else %}
           {{ 999 }}
         {% endif %}
 
+      discharge_reference_price: >
+        {% set ns = namespace(lowest=999) %}
+        {% set start_limit = as_timestamp(now()) - 24 * 3600 %}
+        {% for item in chart_data if item is mapping %}
+          {% set start_ts = as_timestamp(item.start_time, 0) %}
+          {% set item_price = item.price_per_kwh | float(999) %}
+          {% if start_ts >= start_limit and start_ts <= as_timestamp(now()) and item_price < ns.lowest %}
+            {% set ns.lowest = item_price %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.lowest }}
+
       discharge_price_offset_value: >
         {{ discharge_price_offset_var | float(0.10) }}
 
       discharge_price_limit: >
-        {% set cheap = planned_charge_price_limit | float(999) %}
-        {% set eff = efficiency | float(0.85) %}
-        {% if cheap < 999 and eff > 0 %}
-          {{ [cheap + (discharge_price_offset_var | float(0.10)), cheap / eff] | max }}
+        {% set cheap = discharge_reference_price | float(999) %}
+        {% if cheap < 999 %}
+          {{ cheap + (discharge_price_offset_var | float(0.10)) }}
         {% else %}
           {{ 999 }}
         {% endif %}
