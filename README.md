@@ -34,12 +34,12 @@ Ein negativer Leistungswert lädt den Akku. `0 W` hält ihn neutral.
 
 | Funktion | Entität |
 |---|---|
-| Batteriemodus | `select.msa_280024230201_mqtt_select` |
-| Batterieleistung | `number.msa_280024230201` |
-| Gemeinsamer SOC | `sensor.msa_280024230201_state_of_charge_system` |
+| Batteriemodus | `select.msa_xxxxxxxxxxxx_mqtt_select` |
+| Batterieleistung | `number.msa_xxxxxxxxxxxx` |
+| Gemeinsamer SOC | `sensor.msa_xxxxxxxxxxxx_state_of_charge_system` |
 | Wallboxstatus | `sensor.easee_charge_up_status` |
-| Aktueller Tibber-Preis | `sensor.zumbuschstr_1_strompreis` |
-| Tibber-Diagrammdaten | `sensor.zumbuschstr_1_diagramm_datenexport` |
+| Aktueller Tibber-Preis | `sensor.xxxxxxxxxxxx_strompreis` |
+| Tibber-Diagrammdaten | `sensor.xxxxxxxxxxxx_diagramm_datenexport` |
 
 Der Diagramm-Datenexport muss im Attribut `data` Einträge mit diesem Aufbau bereitstellen:
 
