@@ -1,13 +1,13 @@
 blueprint:
   name: 🔋 Hausbatterie Steuerung mit Wallbox & Strompreis
   description: >
-    Version 0.9.3
+    Version 0.10.0
 
     Steuert eine Hoymiles/MS-A2 Hausbatterie bei Wallbox-Ladung,
     manuellem Sofortladen, dynamischem Preisladen und preisabhängiger
     Akku-Entladung.
 
-    Änderungen in 0.9.3:
+    Änderungen in 0.10.0:
     - Wertet die 15-Minuten-Preise aus dem Tibber-Diagramm-Datenexport aus.
     - Berechnet bei 1,2 kW Ladeleistung aus SOC, Ziel-SOC und Kapazität automatisch
       die Anzahl der benötigten günstigen Viertelstunden.
@@ -15,6 +15,8 @@ blueprint:
       plant die Ladung gezielt in die günstigsten Zeitfenster vor dieser Spitze.
     - Gibt es keine solche Spitze, wird trotzdem in den günstigsten Zeitfenstern
       des Planungshorizonts geladen. Der Preisaufschlag sperrt nur die Entladung.
+    - Ein eigener input_boolean schaltet jederzeit zwischen dynamischer Planung
+      und Laden unterhalb der fest eingestellten Preisgrenze um.
     - Der bisherige Preislade-Schalter aktiviert die gesamte Preisautomatik.
     - Der Akku entlädt nur, wenn der Preis gegenüber dem geplanten Ladepreis
       mindestens um den eingestellten Preisaufschlag höher liegt.
@@ -99,6 +101,16 @@ blueprint:
         entity:
           domain: sensor
 
+    fixed_price_mode_switch:
+      name: Fixen Ladewert verwenden Schalter
+      description: >
+        Aus = dynamische Auswahl der günstigsten Zeitfenster.
+        An = laden, sobald der Strompreis unter der festen Lade-Preisgrenze liegt.
+        Beispiel: input_boolean.akku_fester_ladewert
+      selector:
+        entity:
+          domain: input_boolean
+
     discharge_block_switch:
       name: Akku-Entladung sperren Schalter
       description: >
@@ -125,15 +137,6 @@ blueprint:
       selector:
         entity:
           domain: input_number
-
-    use_price_ceiling:
-      name: Lade-Preisgrenze als Obergrenze verwenden
-      description: >
-        Aus = allein die relativ günstigsten Viertelstunden entscheiden.
-        An = zusätzlich muss der Preis unter dem Preisgrenzen-Helfer liegen.
-      default: false
-      selector:
-        boolean: {}
 
     price_sensor:
       name: Strompreis Sensor
@@ -280,6 +283,10 @@ trigger:
     entity_id: !input price_chart_sensor
     id: price_chart_changed
 
+  - platform: state
+    entity_id: !input fixed_price_mode_switch
+    id: fixed_price_mode_changed
+
   - platform: time_pattern
     seconds: "/30"
     id: repeat_send
@@ -293,13 +300,13 @@ action:
       price_threshold_number_var: !input price_threshold_number
       price_sensor_var: !input price_sensor
       price_chart_sensor_var: !input price_chart_sensor
+      fixed_price_mode_switch_var: !input fixed_price_mode_switch
       wallbox_status_sensor_var: !input wallbox_status_sensor
       force_charge_switch_var: !input force_charge_switch
       price_charging_switch_var: !input price_charging_switch
       discharge_block_switch_var: !input discharge_block_switch
 
       allow_price_charge_while_wallbox_var: !input allow_price_charge_while_wallbox
-      use_price_ceiling_var: !input use_price_ceiling
       charge_power_var: !input charge_power
       battery_capacity_var: !input battery_capacity
       planning_horizon_var: !input planning_horizon
@@ -320,6 +327,9 @@ action:
 
       price_threshold: >
         {{ (states(price_threshold_number_var) | string | replace(',', '.')) | float(0.16) }}
+
+      fixed_price_mode_on: >
+        {{ is_state(fixed_price_mode_switch_var, 'on') }}
 
       chart_data: >
         {{ state_attr(price_chart_sensor_var, 'data') or [] }}
@@ -375,7 +385,7 @@ action:
           {{ 999 }}
         {% endif %}
 
-      discharge_reference_price: >
+      dynamic_discharge_reference_price: >
         {% set ns = namespace(lowest=999) %}
         {% set start_limit = as_timestamp(now()) - 24 * 3600 %}
         {% for item in chart_data if item is mapping %}
@@ -391,7 +401,7 @@ action:
         {{ discharge_price_offset_var | float(0.10) }}
 
       discharge_price_limit: >
-        {% set cheap = discharge_reference_price | float(999) %}
+        {% set cheap = (price_threshold | float(999)) if fixed_price_mode_on | bool(false) else (dynamic_discharge_reference_price | float(999)) %}
         {% if cheap < 999 %}
           {{ cheap + (discharge_price_offset_var | float(0.10)) }}
         {% else %}
@@ -444,14 +454,17 @@ action:
           and price_valid | bool(false)
           and soc_valid | bool(false)
           and target_soc_valid | bool(false)
-          and (required_slots | int(0)) > 0
-          and (planned_charge_price_limit | float(999)) < 999
-          and (price | float(999)) <= (planned_charge_price_limit | float(999)) + 0.00001
           and (
-            not (use_price_ceiling_var | bool(false))
-            or (
-              price_threshold_valid | bool(false)
+            (
+              fixed_price_mode_on | bool(false)
+              and price_threshold_valid | bool(false)
               and (price | float(999)) <= (price_threshold | float(0.16))
+            )
+            or (
+              not (fixed_price_mode_on | bool(false))
+              and (required_slots | int(0)) > 0
+              and (planned_charge_price_limit | float(999)) < 999
+              and (price | float(999)) <= (planned_charge_price_limit | float(999)) + 0.00001
             )
           )
           and (soc | float(999)) < (target_soc | float(0))
@@ -465,6 +478,10 @@ action:
         {{
           price_charging_enabled | bool(false)
           and price_valid | bool(false)
+          and (
+            not (fixed_price_mode_on | bool(false))
+            or price_threshold_valid | bool(false)
+          )
           and (price | float(999)) >= (discharge_price_limit | float(999))
         }}
 
@@ -493,7 +510,7 @@ action:
             data:
               value: "{{ charge_power_var | float(0) }}"
 
-      - alias: Dynamische Preisautomatik - aktuelles Viertel ist günstig
+      - alias: Preisautomatik - aktueller Preis erfüllt den gewählten Lademodus
         conditions:
           - condition: template
             value_template: "{{ price_charge_active | bool(false) }}"
